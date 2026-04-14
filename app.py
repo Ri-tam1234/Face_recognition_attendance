@@ -1,5 +1,10 @@
 import streamlit as st
-import cv2
+try:
+    import cv2
+except:
+    import streamlit as st
+    st.error("OpenCV not supported in cloud. Switching mode...")
+    st.stop()
 import pickle
 import numpy as np
 import os
