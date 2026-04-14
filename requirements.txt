@@ -1,5 +1,7 @@
 streamlit
 streamlit-webrtc
 opencv-python-headless
+face-recognition
 numpy
+pandas
 av
