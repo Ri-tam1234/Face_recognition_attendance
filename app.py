@@ -1,26 +1,48 @@
 import streamlit as st
 import cv2
 import numpy as np
-import os
 import pandas as pd
+import os
 from datetime import datetime
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 
-# ---------------- PATHS ---------------- #
+# ---------------- FILE PATH ---------------- #
 BASE_DIR = os.path.dirname(__file__)
+DATASET_PATH = os.path.join(BASE_DIR, "dataset")
 ATTENDANCE_PATH = os.path.join(BASE_DIR, "attendance.csv")
 
-# ---------------- OPENCV FACE MODEL ---------------- #
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+os.makedirs(DATASET_PATH, exist_ok=True)
 
-# ---------------- SIMPLE MEMORY DATABASE ---------------- #
-if "known_faces" not in st.session_state:
-    st.session_state.known_faces = []   # (name, face_vector)
+# ---------------- FACE MODEL ---------------- #
+recognizer = cv2.face.LBPHFaceRecognizer_create()
 
-if "marked" not in st.session_state:
-    st.session_state.marked = set()
+# ---------------- TRAIN MODEL ---------------- #
+def train_model():
+    faces = []
+    labels = []
+    label_map = {}
+
+    label_id = 0
+
+    for file in os.listdir(DATASET_PATH):
+        if file.endswith(".npy"):
+            name = file.replace(".npy", "")
+            data = np.load(os.path.join(DATASET_PATH, file))
+
+            label_map[label_id] = name
+
+            for face in data:
+                faces.append(face)
+                labels.append(label_id)
+
+            label_id += 1
+
+    if len(faces) > 0:
+        recognizer.train(faces, np.array(labels))
+        return label_map
+    return {}
+
+label_map = train_model()
 
 # ---------------- ATTENDANCE ---------------- #
 def mark_attendance(name):
@@ -40,24 +62,21 @@ def mark_attendance(name):
 
         df.to_csv(ATTENDANCE_PATH, index=False)
 
-# ---------------- SIMPLE FACE MATCH ---------------- #
-def match_face(face_img, known_faces):
-    face = cv2.resize(face_img, (50, 50)).flatten()
+# ---------------- SESSION STATE ---------------- #
+if "marked" not in st.session_state:
+    st.session_state.marked = set()
 
-    best_match = None
-    min_dist = float("inf")
+# ---------------- FACE DETECTOR ---------------- #
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
 
-    for name, vec in known_faces:
-        dist = np.linalg.norm(vec - face)
-        if dist < min_dist:
-            min_dist = dist
-            best_match = name
+# ---------------- UI ---------------- #
+st.title("🔥 FAST Face Attendance System (NO LAG VERSION)")
 
-    if min_dist < 3000:
-        return best_match
-    return "Unknown"
+menu = st.sidebar.selectbox("Menu", ["Live", "Add Face", "Attendance"])
 
-# ---------------- STREAM PROCESSOR ---------------- #
+# ---------------- LIVE CAMERA ---------------- #
 class FaceProcessor(VideoTransformerBase):
 
     def transform(self, frame):
@@ -67,30 +86,33 @@ class FaceProcessor(VideoTransformerBase):
         faces = face_cascade.detectMultiScale(gray, 1.3, 5)
 
         for (x, y, w, h) in faces:
-            face_roi = img[y:y+h, x:x+w]
+            face = gray[y:y+h, x:x+w]
+            face = cv2.resize(face, (200, 200))
 
-            name = match_face(face_roi, st.session_state.known_faces)
+            label, confidence = recognizer.predict(face)
 
-            if name != "Unknown" and name not in st.session_state.marked:
-                mark_attendance(name)
-                st.session_state.marked.add(name)
+            name = "Unknown"
 
+            if confidence < 70:
+                name = label_map.get(label, "Unknown")
+
+                if name not in st.session_state.marked:
+                    mark_attendance(name)
+                    st.session_state.marked.add(name)
+
+            # Draw box + text
             cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            cv2.putText(img, name, (x, y-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+            cv2.putText(img, f"{name}", (x, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                         (0, 255, 0), 2)
 
         return img
 
-# ---------------- UI ---------------- #
-st.title("⚡ FAST Face Attendance System (Stable Version)")
-
-menu = st.sidebar.selectbox("Menu", ["Live", "Add Face", "Attendance"])
-
-# ---------------- LIVE ---------------- #
+# ---------------- LIVE PAGE ---------------- #
 if menu == "Live":
+
     webrtc_streamer(
-        key="fast",
+        key="fast-face",
         video_transformer_factory=FaceProcessor,
         media_stream_constraints={"video": True, "audio": False},
     )
@@ -98,9 +120,9 @@ if menu == "Live":
 # ---------------- ADD FACE ---------------- #
 elif menu == "Add Face":
 
-    st.subheader("Add Face (Take Snapshot)")
+    st.subheader("➕ Add Face (Fast Dataset Builder)")
 
-    name = st.text_input("Enter Name")
+    name = st.text_input("Enter Name + ID")
 
     img_file = st.camera_input("Capture Face")
 
@@ -110,24 +132,34 @@ elif menu == "Add Face":
         img = cv2.imdecode(file_bytes, 1)
 
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
         faces = face_cascade.detectMultiScale(gray, 1.3, 5)
 
         if len(faces) == 0:
             st.error("No face detected")
         else:
             x, y, w, h = faces[0]
-            face_roi = img[y:y+h, x:x+w]
-            face_vec = cv2.resize(face_roi, (50, 50)).flatten()
+            face = gray[y:y+h, x:x+w]
+            face = cv2.resize(face, (200, 200))
 
-            st.session_state.known_faces.append((name, face_vec))
+            file_path = os.path.join(DATASET_PATH, f"{name}.npy")
 
-            st.success(f"Face added for {name}")
+            if os.path.exists(file_path):
+                data = np.load(file_path)
+                data = np.append(data, [face], axis=0)
+            else:
+                data = np.array([face])
 
-# ---------------- ATTENDANCE ---------------- #
+            np.save(file_path, data)
+
+            st.success(f"Face saved for {name}")
+            st.info("Restart app to retrain model")
+
+# ---------------- ATTENDANCE PAGE ---------------- #
 elif menu == "Attendance":
 
     if os.path.exists(ATTENDANCE_PATH):
         df = pd.read_csv(ATTENDANCE_PATH)
         st.dataframe(df)
     else:
-        st.warning("No attendance yet")
+        st.warning("No attendance recorded yet")
