@@ -1,8 +1,6 @@
 import streamlit as st
 import cv2
 import numpy as np
-import face_recognition
-import pickle
 import os
 import pandas as pd
 from datetime import datetime
@@ -10,25 +8,19 @@ from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 
 # ---------------- PATHS ---------------- #
 BASE_DIR = os.path.dirname(__file__)
-DATA_PATH = os.path.join(BASE_DIR, "data", "faces.pkl")
-ATTENDANCE_PATH = os.path.join(BASE_DIR, "data", "attendance.csv")
+ATTENDANCE_PATH = os.path.join(BASE_DIR, "attendance.csv")
 
-os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
+# ---------------- OPENCV FACE MODEL ---------------- #
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
 
-# ---------------- LOAD FACES ---------------- #
-def load_faces():
-    if os.path.exists(DATA_PATH):
-        with open(DATA_PATH, "rb") as f:
-            return pickle.load(f)
-    return {"names": [], "encodings": []}
+# ---------------- SIMPLE MEMORY DATABASE ---------------- #
+if "known_faces" not in st.session_state:
+    st.session_state.known_faces = []   # (name, face_vector)
 
-def save_faces(data):
-    with open(DATA_PATH, "wb") as f:
-        pickle.dump(data, f)
-
-faces_data = load_faces()
-known_encodings = faces_data["encodings"]
-known_names = faces_data["names"]
+if "marked" not in st.session_state:
+    st.session_state.marked = set()
 
 # ---------------- ATTENDANCE ---------------- #
 def mark_attendance(name):
@@ -40,118 +32,99 @@ def mark_attendance(name):
     today = datetime.now().strftime("%Y-%m-%d")
 
     if not ((df["Name"] == name) & (df["Date"] == today)).any():
-        new_row = {
+        df = pd.concat([df, pd.DataFrame([{
             "Name": name,
             "Time": datetime.now().strftime("%H:%M:%S"),
             "Date": today
-        }
-        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        }])], ignore_index=True)
+
         df.to_csv(ATTENDANCE_PATH, index=False)
 
-# ---------------- SESSION STATE ---------------- #
-if "marked" not in st.session_state:
-    st.session_state.marked = set()
+# ---------------- SIMPLE FACE MATCH ---------------- #
+def match_face(face_img, known_faces):
+    face = cv2.resize(face_img, (50, 50)).flatten()
 
-if "new_face_encoding" not in st.session_state:
-    st.session_state.new_face_encoding = None
+    best_match = None
+    min_dist = float("inf")
 
-if "new_face_name" not in st.session_state:
-    st.session_state.new_face_name = ""
+    for name, vec in known_faces:
+        dist = np.linalg.norm(vec - face)
+        if dist < min_dist:
+            min_dist = dist
+            best_match = name
 
-# ---------------- UI ---------------- #
-st.title("🔥 PRO Face Attendance System")
+    if min_dist < 3000:
+        return best_match
+    return "Unknown"
 
-menu = st.sidebar.selectbox(
-    "Menu",
-    ["Live Attendance", "Add New Face", "View Attendance"]
-)
-
-# ---------------- LIVE CAMERA ---------------- #
+# ---------------- STREAM PROCESSOR ---------------- #
 class FaceProcessor(VideoTransformerBase):
 
     def transform(self, frame):
         img = frame.to_ndarray(format="bgr24")
 
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
 
-        face_locations = face_recognition.face_locations(rgb)
-        face_encodings = face_recognition.face_encodings(rgb, face_locations)
+        for (x, y, w, h) in faces:
+            face_roi = img[y:y+h, x:x+w]
 
-        for (top, right, bottom, left), encoding in zip(face_locations, face_encodings):
+            name = match_face(face_roi, st.session_state.known_faces)
 
-            matches = face_recognition.compare_faces(known_encodings, encoding)
-            name = "Unknown"
+            if name != "Unknown" and name not in st.session_state.marked:
+                mark_attendance(name)
+                st.session_state.marked.add(name)
 
-            face_distances = face_recognition.face_distance(known_encodings, encoding)
-
-            if len(face_distances) > 0:
-                best_match = np.argmin(face_distances)
-
-                if matches[best_match]:
-                    name = known_names[best_match]
-
-                    # prevent duplicates
-                    if name not in st.session_state.marked:
-                        mark_attendance(name)
-                        st.session_state.marked.add(name)
-
-            cv2.rectangle(img, (left, top), (right, bottom), (0, 255, 0), 2)
-            cv2.putText(img, name, (left, top - 10),
+            cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.putText(img, name, (x, y-10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                         (0, 255, 0), 2)
 
         return img
 
-# ---------------- PAGE 1: LIVE ---------------- #
-if menu == "Live Attendance":
+# ---------------- UI ---------------- #
+st.title("⚡ FAST Face Attendance System (Stable Version)")
 
-    st.subheader("📡 Live Face Recognition")
+menu = st.sidebar.selectbox("Menu", ["Live", "Add Face", "Attendance"])
 
+# ---------------- LIVE ---------------- #
+if menu == "Live":
     webrtc_streamer(
-        key="pro-face",
+        key="fast",
         video_transformer_factory=FaceProcessor,
         media_stream_constraints={"video": True, "audio": False},
     )
 
-# ---------------- PAGE 2: ADD FACE ---------------- #
-elif menu == "Add New Face":
+# ---------------- ADD FACE ---------------- #
+elif menu == "Add Face":
 
-    st.subheader("➕ Add New Face")
+    st.subheader("Add Face (Take Snapshot)")
 
     name = st.text_input("Enter Name")
 
-    webrtc_ctx = webrtc_streamer(
-        key="add-face",
-        media_stream_constraints={"video": True, "audio": False}
-    )
+    img_file = st.camera_input("Capture Face")
 
-    if st.button("Capture Face"):
-        if webrtc_ctx.video_transformer:
-            frame = webrtc_ctx.video_transformer.frame
+    if img_file is not None and name:
 
-            if frame is not None:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                encodings = face_recognition.face_encodings(rgb)
+        file_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
+        img = cv2.imdecode(file_bytes, 1)
 
-                if len(encodings) > 0:
-                    encoding = encodings[0]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
 
-                    known_encodings.append(encoding)
-                    known_names.append(name)
+        if len(faces) == 0:
+            st.error("No face detected")
+        else:
+            x, y, w, h = faces[0]
+            face_roi = img[y:y+h, x:x+w]
+            face_vec = cv2.resize(face_roi, (50, 50)).flatten()
 
-                    save_faces({
-                        "names": known_names,
-                        "encodings": known_encodings
-                    })
+            st.session_state.known_faces.append((name, face_vec))
 
-                    st.success(f"Face added for {name}")
-                else:
-                    st.error("No face detected")
+            st.success(f"Face added for {name}")
 
-# ---------------- PAGE 3: VIEW ATTENDANCE ---------------- #
-elif menu == "View Attendance":
-
-    st.subheader("📋 Attendance Records")
+# ---------------- ATTENDANCE ---------------- #
+elif menu == "Attendance":
 
     if os.path.exists(ATTENDANCE_PATH):
         df = pd.read_csv(ATTENDANCE_PATH)
