@@ -1,165 +1,129 @@
 import streamlit as st
 import cv2
 import numpy as np
-import pandas as pd
+import pickle
 import os
+import csv
 from datetime import datetime
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
+from data_manager import parse_label
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import normalize
 
-# ---------------- FILE PATH ---------------- #
+# ---------------- UI CONFIG ---------------- #
+st.set_page_config(page_title="Face Attendance System", layout="wide")
+
+st.title("🎯 Smart Face Attendance System")
+
+# ---------------- LOAD DATA ---------------- #
 BASE_DIR = os.path.dirname(__file__)
-DATASET_PATH = os.path.join(BASE_DIR, "dataset")
-ATTENDANCE_PATH = os.path.join(BASE_DIR, "attendance.csv")
 
-os.makedirs(DATASET_PATH, exist_ok=True)
+face_path = os.path.join(BASE_DIR, "data", "faces_data.pkl")
+name_path = os.path.join(BASE_DIR, "data", "names.pkl")
 
-# ---------------- FACE MODEL ---------------- #
-recognizer = cv2.face.LBPHFaceRecognizer_create()
+faces = np.array(pickle.load(open(face_path, "rb")))
+labels = pickle.load(open(name_path, "rb"))
 
-# ---------------- TRAIN MODEL ---------------- #
-def train_model():
-    faces = []
-    labels = []
-    label_map = {}
+faces = faces / 255.0
+faces = normalize(faces)
 
-    label_id = 0
+model = KNeighborsClassifier(n_neighbors=5, metric="cosine")
+model.fit(faces, labels)
 
-    for file in os.listdir(DATASET_PATH):
-        if file.endswith(".npy"):
-            name = file.replace(".npy", "")
-            data = np.load(os.path.join(DATASET_PATH, file))
+# ---------------- ATTENDANCE FILE ---------------- #
+attendance_dir = os.path.join(BASE_DIR, "Attendance")
+os.makedirs(attendance_dir, exist_ok=True)
 
-            label_map[label_id] = name
+date = datetime.now().strftime("%d-%m-%Y")
+file_path = os.path.join(attendance_dir, f"{date}.csv")
 
-            for face in data:
-                faces.append(face)
-                labels.append(label_id)
-
-            label_id += 1
-
-    if len(faces) > 0:
-        recognizer.train(faces, np.array(labels))
-        return label_map
-    return {}
-
-label_map = train_model()
-
-# ---------------- ATTENDANCE ---------------- #
-def mark_attendance(name):
-    if os.path.exists(ATTENDANCE_PATH):
-        df = pd.read_csv(ATTENDANCE_PATH)
-    else:
-        df = pd.DataFrame(columns=["Name", "Time", "Date"])
-
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    if not ((df["Name"] == name) & (df["Date"] == today)).any():
-        df = pd.concat([df, pd.DataFrame([{
-            "Name": name,
-            "Time": datetime.now().strftime("%H:%M:%S"),
-            "Date": today
-        }])], ignore_index=True)
-
-        df.to_csv(ATTENDANCE_PATH, index=False)
+if not os.path.exists(file_path):
+    with open(file_path, "w", newline="") as f:
+        csv.writer(f).writerow(["ID", "NAME", "DATE", "TIME"])
 
 # ---------------- SESSION STATE ---------------- #
 if "marked" not in st.session_state:
     st.session_state.marked = set()
 
-# ---------------- FACE DETECTOR ---------------- #
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+if "present" not in st.session_state:
+    st.session_state.present = []
 
-# ---------------- UI ---------------- #
-st.title("🔥 FAST Face Attendance System (NO LAG VERSION)")
+# ---------------- SIDEBAR ---------------- #
+st.sidebar.header("⚙️ Controls")
+run = st.sidebar.checkbox("Start Camera")
 
-menu = st.sidebar.selectbox("Menu", ["Live", "Add Face", "Attendance"])
+st.sidebar.markdown("### 📌 Instructions")
+st.sidebar.info("Enable camera to start face recognition attendance")
 
-# ---------------- LIVE CAMERA ---------------- #
-class FaceProcessor(VideoTransformerBase):
-
+# ---------------- VIDEO PROCESSING ---------------- #
+class FaceTransformer(VideoTransformerBase):
     def transform(self, frame):
         img = frame.to_ndarray(format="bgr24")
 
+        detector = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        faces_detected = detector.detectMultiScale(gray, 1.2, 5)
 
-        for (x, y, w, h) in faces:
-            face = gray[y:y+h, x:x+w]
-            face = cv2.resize(face, (200, 200))
+        for (x, y, w, h) in faces_detected:
+            face = img[y:y+h, x:x+w]
+            face = cv2.resize(face, (50, 50)).flatten().reshape(1, -1)
+            face = normalize(face / 255.0)
 
-            label, confidence = recognizer.predict(face)
+            distances, _ = model.kneighbors(face)
+            pred = model.predict(face)[0]
+            dist = distances[0][0]
 
-            name = "Unknown"
+            name, uid = parse_label(pred)
 
-            if confidence < 70:
-                name = label_map.get(label, "Unknown")
+            if dist < 0.35:
+                label = f"{name} ({uid})"
+                color = (0, 255, 0)
 
-                if name not in st.session_state.marked:
-                    mark_attendance(name)
-                    st.session_state.marked.add(name)
+                if uid not in st.session_state.marked:
+                    st.session_state.marked.add(uid)
+                    st.session_state.present.append(label)
 
-            # Draw box + text
-            cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            cv2.putText(img, f"{name}", (x, y-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                        (0, 255, 0), 2)
+                    with open(file_path, "a", newline="") as f:
+                        csv.writer(f).writerow([
+                            uid,
+                            name,
+                            date,
+                            datetime.now().strftime("%H:%M:%S")
+                        ])
+            else:
+                label = "UNKNOWN"
+                color = (0, 0, 255)
+
+            cv2.rectangle(img, (x, y), (x+w, y+h), color, 2)
+            cv2.putText(img, label, (x, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         return img
 
-# ---------------- LIVE PAGE ---------------- #
-if menu == "Live":
+# ---------------- LAYOUT ---------------- #
+col1, col2 = st.columns([2, 1])
 
-    webrtc_streamer(
-        key="fast-face",
-        video_transformer_factory=FaceProcessor,
-        media_stream_constraints={"video": True, "audio": False},
-    )
-
-# ---------------- ADD FACE ---------------- #
-elif menu == "Add Face":
-
-    st.subheader("➕ Add Face (Fast Dataset Builder)")
-
-    name = st.text_input("Enter Name + ID")
-
-    img_file = st.camera_input("Capture Face")
-
-    if img_file is not None and name:
-
-        file_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, 1)
-
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-
-        if len(faces) == 0:
-            st.error("No face detected")
-        else:
-            x, y, w, h = faces[0]
-            face = gray[y:y+h, x:x+w]
-            face = cv2.resize(face, (200, 200))
-
-            file_path = os.path.join(DATASET_PATH, f"{name}.npy")
-
-            if os.path.exists(file_path):
-                data = np.load(file_path)
-                data = np.append(data, [face], axis=0)
-            else:
-                data = np.array([face])
-
-            np.save(file_path, data)
-
-            st.success(f"Face saved for {name}")
-            st.info("Restart app to retrain model")
-
-# ---------------- ATTENDANCE PAGE ---------------- #
-elif menu == "Attendance":
-
-    if os.path.exists(ATTENDANCE_PATH):
-        df = pd.read_csv(ATTENDANCE_PATH)
-        st.dataframe(df)
+with col1:
+    st.subheader("📷 Live Camera")
+    if run:
+        webrtc_streamer(key="face", video_transformer_factory=FaceTransformer)
     else:
-        st.warning("No attendance recorded yet")
+        st.warning("Camera is OFF")
+
+with col2:
+    st.subheader("👥 Present Students")
+
+    if st.session_state.present:
+        for p in st.session_state.present:
+            st.success(p)
+    else:
+        st.info("No attendance yet")
+
+    st.subheader("📊 Attendance Log")
+
+    if os.path.exists(file_path):
+        with open(file_path, "r") as f:
+            st.text(f.read())
